@@ -24,6 +24,8 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+#[cfg(feature = "x509-parser")]
+use instant_acme::CsrError;
 use instant_acme::{
     Account, AuthorizationStatus, BodyWrapper, ChallengeHandle, ChallengeType, CryptoProvider, Csr,
     Error, ExternalAccountKey, Identifier, Key, KeyAuthorization, NewAccount, NewOrder, Order,
@@ -115,9 +117,29 @@ async fn external_csr() -> Result<(), Box<dyn StdError>> {
     let csr = params.serialize_request(&key_pair)?;
 
     // Hand over the CSR as PEM, exercising `Csr::from_pem()` as well as `finalize_with()`.
-    order
-        .finalize_with(&Csr::from_pem(csr.pem()?.as_bytes())?)
-        .await?;
+    let csr = Csr::from_pem(csr.pem()?.as_bytes())?;
+
+    #[cfg(feature = "x509-parser")]
+    {
+        // A CSR for a name this order does not authorize is caught locally, so it costs
+        // neither a finalization nor the order.
+        let mut params = CertificateParams::new(vec!["other.example.com".to_owned()])?;
+        params.distinguished_name = DistinguishedName::new();
+        let mismatched = params.serialize_request(&key_pair)?;
+        let err = order
+            .validate_csr(&Csr::from(mismatched.der()))
+            .await
+            .expect_err("a CSR for another name should not validate");
+        assert!(matches!(
+            err,
+            Error::Csr(CsrError::MissingIdentifier(_) | CsrError::UnexpectedIdentifier(_))
+        ));
+
+        // The CSR we are about to use, on the other hand, matches the order.
+        order.validate_csr(&csr).await?;
+    }
+
+    order.finalize_with(&csr).await?;
 
     let chain = order.poll_certificate(&RETRY_POLICY).await?;
     let ee_cert = CertificateDer::from_pem_slice(chain.as_bytes())?;

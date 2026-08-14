@@ -64,6 +64,8 @@ pub use types::{
     NewOrder, OctetKeyCurve, OrderState, OrderStatus, Problem, ProfileMeta, RevocationReason,
     RevocationRequest, SigningAlgorithm, Subproblem, ZeroSsl,
 };
+#[cfg(feature = "x509-parser")]
+pub use types::{CsrError, CsrPolicy};
 use types::{Directory, JoseJson, Signer};
 #[cfg(feature = "time")]
 pub use types::{RenewalInfo, SuggestedWindow};

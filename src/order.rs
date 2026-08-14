@@ -11,6 +11,8 @@ use serde::Serialize;
 use tokio::time::sleep;
 
 use crate::account::AccountInner;
+#[cfg(feature = "x509-parser")]
+use crate::types::CsrPolicy;
 use crate::types::{
     Authorization, AuthorizationState, AuthorizationStatus, AuthorizedIdentifier, Challenge,
     ChallengeType, Csr, DeviceAttestation, Empty, FinalizeRequest, OrderState, OrderStatus,
@@ -97,6 +99,61 @@ impl Order {
     /// Prefer [`Order::finalize_with()`], which takes a [`Csr`] and so also accepts PEM input.
     pub async fn finalize_csr(&mut self, csr_der: &[u8]) -> Result<(), Error> {
         self.finalize_with(&Csr::from(csr_der)).await
+    }
+
+    /// Check a CSR against this order before finalizing with it
+    ///
+    /// Runs the checks a CA would run, without asking the CA: that the CSR asks for exactly
+    /// the order's identifiers, that its subject common name (if any) is among them, that its
+    /// signature verifies, and that its key is not the account key (RFC 8555 section 11.1).
+    /// A failure here would otherwise cost you a rejected finalization and one of your
+    /// rate-limited orders.
+    ///
+    /// The only network access this may involve is fetching the order's authorizations, if
+    /// they have not been fetched yet.
+    ///
+    /// ```no_run
+    /// # use instant_acme::{Csr, Error, Order};
+    /// # async fn f(order: &mut Order, csr_pem: &[u8]) -> Result<(), Error> {
+    /// let csr = Csr::from_pem(csr_pem)?;
+    /// order.validate_csr(&csr).await?;
+    /// order.finalize_with(&csr).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "x509-parser")]
+    #[cfg_attr(instant_acme_docsrs, doc(cfg(feature = "x509-parser")))]
+    pub async fn validate_csr(&mut self, csr: &Csr<'_>) -> Result<(), Error> {
+        self.validate_csr_with(csr, &CsrPolicy::default()).await
+    }
+
+    /// Check a CSR against this order using the given [`CsrPolicy`]
+    ///
+    /// See [`Order::validate_csr()`] for what is checked.
+    #[cfg(feature = "x509-parser")]
+    #[cfg_attr(instant_acme_docsrs, doc(cfg(feature = "x509-parser")))]
+    pub async fn validate_csr_with(
+        &mut self,
+        csr: &Csr<'_>,
+        policy: &CsrPolicy,
+    ) -> Result<(), Error> {
+        // Collect owned identifiers first: the stream borrows `self`, and we need the account
+        // key afterwards. The wildcard bit matters here, so keep it with each identifier.
+        let mut identifiers = Vec::with_capacity(self.state.authorizations.len());
+        let mut stream = self.identifiers();
+        while let Some(result) = stream.next().await {
+            let identifier = result?;
+            identifiers.push((identifier.identifier.clone(), identifier.wildcard));
+        }
+
+        let authorized = identifiers
+            .iter()
+            .map(|(identifier, wildcard)| identifier.authorized(*wildcard))
+            .collect::<Vec<_>>();
+
+        csr.validate_with(&authorized, policy)?;
+        csr.check_account_key(&self.account.key)?;
+        Ok(())
     }
 
     /// Request a certificate for the key pair the given CSR was signed with
