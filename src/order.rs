@@ -109,6 +109,12 @@ impl Order {
     /// A failure here would otherwise cost you a rejected finalization and one of your
     /// rate-limited orders.
     ///
+    /// Passing is not a promise that the CA will accept the CSR. In particular, the signature
+    /// check is skipped when it cannot be performed: with neither the `aws-lc-rs` nor the
+    /// `ring` feature enabled (no verifier to use), or for a signature algorithm the parser
+    /// does not implement. A CSR that fails a check the other way around — one this rejects
+    /// but the CA would accept — should be reported as a bug.
+    ///
     /// The only network access this may involve is fetching the order's authorizations, if
     /// they have not been fetched yet.
     ///

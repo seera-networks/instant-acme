@@ -186,7 +186,9 @@ impl Csr<'_> {
 3. **余剰 SAN の検出** — CSR にオーダー外の名前があると CA は拒否する。エラーにするか警告に留めるかは要検討（デフォルトはエラー、`allow_extra_names()` で緩和）。
 4. **CN の扱い** — Subject CN があるのに SAN に無い場合、Boulder は拒否する。検出してエラーにする。
 5. **アカウント鍵の再利用禁止**（RFC 8555 §11.1）— CSR の公開鍵がアカウント鍵と一致したらエラー。やらかすと CA から拒否され原因が分かりにくいので実利は大きい。`Order::validate_csr()` でのみ実施。実装は CSR の SubjectPublicKeyInfo からアカウント鍵と同じ表現（JWK サムプリント等）を導いて比較する形になるため、instant-acme が JWK 化できる鍵種別（現状 P-256）以外では比較をスキップする。
-6. **署名検証**（任意）— `verify_signature()`。`x509-parser` の `verify` / `verify-aws` feature が要るため、instant-acme 側で `x509-parser?/verify-aws`（`aws-lc-rs` 有効時）/ `x509-parser?/verify`（`ring` 有効時）へマッピングする。既存の `rcgen/aws_lc_rs`・`rcgen/ring` と同じ書き方で `Cargo.toml` の `[features]` に足せる。
+6. **署名検証**（best-effort）— `verify_signature()`。`x509-parser` の `verify` / `verify-aws` feature が要るため、instant-acme 側で `x509-parser?/verify-aws`（`aws-lc-rs` 有効時）/ `x509-parser?/verify`（`ring` 有効時）へマッピングする。
+   - **検証できない場合はスキップする**（#3 で決定）。バックエンド feature が無い構成には検証器が無く、また x509-parser が未実装の署名アルゴリズム（`ecdsa-with-SHA512`、P-521、RSA-PSS/SHA-1 など）では `SignatureUnsupportedAlgorithm` が返る。これらを「署名が不正」として扱うと、CA が受理する正当な CSR を発行前に弾いてしまうため、`BadSignature` は本当に検証に失敗した場合だけに限る。
+   - 結果として `validate_csr()` は「通れば CA も受理する」保証ではなく「明らかな不整合を事前に潰す」ものになる。この非対称性（誤検知はしない / 検知漏れはありうる）は 5 のアカウント鍵チェックと同じ方針で、rustdoc に明記する。
 
 **呼び出しタイミングの設計上の論点**: `finalize_with` が feature 有効時に暗黙で `validate()` を呼ぶ設計は、Cargo の feature unification によって「別のクレートが `x509-parser` を有効化したせいで挙動が変わる」問題を招く。したがって**暗黙呼び出しはしない**。検証は呼び出し側が明示的に行い、ドキュメントとサンプルで強く推奨する。
 
@@ -346,7 +348,7 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
   | （なし） | `Csr::from_der` / `from_pem`（バイト列）/ `finalize_with` が使える。鍵生成コードはリンクされない |
   | `fs`（`hyper-rustls` が含む） | `Csr::from_pem_file()` が使える（`rustls-pki-types/std` を有効化） |
   | `x509-parser` | `Order::validate_csr()` / `Csr::validate()` / `CsrPolicy` / `CsrError` が使える |
-  | `x509-parser` + `aws-lc-rs` / `ring` | 上記に加えて CSR 署名検証が有効（`x509-parser?/verify-aws` / `?/verify` を伝播） |
+  | `x509-parser` + `aws-lc-rs` / `ring` | 上記に加えて CSR 署名検証が有効（`x509-parser?/verify-aws` / `?/verify` を伝播）。バックエンドが無い構成では検証だけがスキップされる |
   | `rcgen`（既定で有効） + バックエンド | 従来どおり `Order::finalize()` による鍵自動生成も使える |
 
 ---
@@ -362,7 +364,8 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
 7. **`fs` という feature 名** — `pem-file` / `file` / `paths` なども候補。`fs` は「ファイルシステムに触る API 群」を表す語として一般的で、将来ファイル系ヘルパが増えても収まる点を評価して推している。`std` は instant-acme が元々 std 必須である以上、誤解を招くので避ける。上流に出す前に名前を合意する。また `hyper-rustls` に `fs` を含める変更は、`hyper-rustls` 単体を有効にしていた利用者にとって feature が 1 つ増えるだけで API は変わらないため非破壊。
 8. **`rcgen?/...` への変更の是非** — 「`aws-lc-rs` を有効にすると `rcgen` も有効になる」現状の挙動は、`Order::finalize()` を常に使えるようにする意図的な設計かもしれない。上流に出す前に Issue で意図を確認する。当リポジトリでは `?` 付き + `default` 入りとし、`--no-default-features` でオプトアウトできる形に落ち着いた（#2）。
 9. **アカウント鍵再利用チェックの適用範囲** — CSR の公開鍵とアカウント鍵の比較は、instant-acme が JWK として表現できる鍵種別（EC / OKP / RSA）でのみ成立する。SPKI を JWK に変換できない鍵種別では比較が成立せず「再利用ではない」と判定される。誤検知はしないが検知漏れはありうる、という非対称性は仕様として受け入れる。
-10. **`CsrError::Parse` が `&'static str` を持つ** — x509-parser のエラー型は `allowed_external_types` に無いため公開 API に出せず、パース失敗の詳細は固定文言に落としている。詳細が必要になったら `Box<dyn Error>` を持たせるか、x509-parser を許可リストに追加するかを検討する。
+10. **subjectAltName の DNS / IP 以外の名前** — 決定済み（#3）: `otherName` は attestation identifier の運び先なので無視し、それ以外（`rfc822Name`、`URI` など）は既定でエラー（`UnexpectedIdentifier`）にする。Boulder はこれらを含む CSR を拒否するため、黙って通すと事前検証の意味がない。`CsrPolicy::allow_extra_identifiers(true)` で緩和できる。
+11. **`CsrError::Parse` が `&'static str` を持つ** — x509-parser のエラー型は `allowed_external_types` に無いため公開 API に出せず、パース失敗の詳細は固定文言に落としている。詳細が必要になったら `Box<dyn Error>` を持たせるか、x509-parser を許可リストに追加するかを検討する。
 
 ---
 

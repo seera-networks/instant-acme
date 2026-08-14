@@ -346,6 +346,7 @@ impl<'a> Csr<'a> {
 
         // The names the CSR asks for.
         let (mut dns, mut ips, mut has_san) = (Vec::new(), Vec::new(), false);
+        let mut other = Vec::new();
         for extension in request.requested_extensions().into_iter().flatten() {
             let ParsedExtension::SubjectAlternativeName(san) = extension else {
                 continue;
@@ -366,8 +367,15 @@ impl<'a> Csr<'a> {
                             }
                         },
                     }),
-                    // Other name types are not something an ACME order authorizes.
-                    _ => {}
+                    // An `otherName` is how attestation identifiers travel, and an ACME order
+                    // for those does not name them in a way we could compare. Leave those be.
+                    GeneralName::OtherName(..) => {}
+                    // Anything else is a name no ACME order authorizes, and a CA will reject
+                    // the CSR over it. Remember it so the policy below can complain.
+                    GeneralName::RFC822Name(name) | GeneralName::URI(name) => {
+                        other.push((*name).to_owned())
+                    }
+                    _ => other.push(format!("{name:?}")),
                 }
             }
         }
@@ -400,6 +408,10 @@ impl<'a> Csr<'a> {
                     return Err(CsrError::UnexpectedIdentifier(addr.to_string()));
                 }
             }
+
+            if let Some(name) = other.first() {
+                return Err(CsrError::UnexpectedIdentifier(name.clone()));
+            }
         }
 
         // A subject common name that is not also a subjectAltName gets the CSR rejected by
@@ -413,17 +425,27 @@ impl<'a> Csr<'a> {
                 .as_str()
                 .map_err(|_| CsrError::Parse("subject common name is not a string"))?;
             let lowercase = name.to_ascii_lowercase();
-            if !dns.contains(&lowercase) && !ips.iter().any(|addr| addr.to_string() == name) {
+            let covered = dns.contains(&lowercase)
+                // A common name holding an IP address needs the same normalization the
+                // subjectAltName values get: `2001:DB8::1` and `2001:db8::1` are one address.
+                || name.parse().is_ok_and(|addr| ips.contains(&addr));
+            if !covered {
                 return Err(CsrError::CommonNameNotInSan(name.to_owned()));
             }
         }
 
-        // Requires x509-parser's `verify`/`verify-aws` feature, which our backend features
-        // turn on for us.
+        // Signature verification uses x509-parser's `verify`/`verify-aws` feature, which our
+        // backend features turn on for us. Without a backend there is nothing to verify with,
+        // and the check is skipped; see the `Order::validate_csr()` docs.
         #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-        request
-            .verify_signature()
-            .map_err(|_| CsrError::BadSignature)?;
+        if let Err(err) = request.verify_signature() {
+            // An algorithm x509-parser cannot check is not evidence of a bad signature: the
+            // CA may well accept the CSR (`ecdsa-with-SHA512` and P-521, for two). Rejecting
+            // it here would block issuance for a CSR that is fine.
+            if err != x509_parser::error::X509Error::SignatureUnsupportedAlgorithm {
+                return Err(CsrError::BadSignature);
+            }
+        }
 
         Ok(())
     }
@@ -1465,6 +1487,9 @@ mod tests {
         const NO_SAN: &[u8] = include_bytes!("../tests/testdata/csr-no-san.der");
         const BAD_SIG: &[u8] = include_bytes!("../tests/testdata/csr-bad-sig.der");
         const EMPTY: &[u8] = include_bytes!("../tests/testdata/csr-empty.der");
+        const SHA512: &[u8] = include_bytes!("../tests/testdata/csr-sha512.der");
+        const CN_IP: &[u8] = include_bytes!("../tests/testdata/csr-cn-ip.der");
+        const EMAIL: &[u8] = include_bytes!("../tests/testdata/csr-email.der");
 
         fn dns(names: &[&str]) -> Vec<Identifier> {
             names
@@ -1606,6 +1631,42 @@ mod tests {
                 check(BAD_SIG, &identifiers, false),
                 Err(CsrError::BadSignature)
             ));
+        }
+
+        #[test]
+        fn unsupported_signature_algorithm() {
+            // A P-256 CSR signed with `ecdsa-with-SHA512`: a CA will take it, but x509-parser
+            // has no verifier for that OID. Not being able to check the signature is not the
+            // same as the signature being wrong, so this must not fail validation.
+            let identifiers = dns(&["example.com"]);
+            check(SHA512, &identifiers, false).unwrap();
+        }
+
+        #[test]
+        fn common_name_as_ip() {
+            // The common name spells the address differently than the subjectAltName does.
+            let identifiers = vec![Identifier::Ip("2001:db8::1".parse().unwrap())];
+            check(CN_IP, &identifiers, false).unwrap();
+        }
+
+        #[test]
+        fn other_name_types() {
+            // An email SAN gets the CSR rejected by the CA, so it is not an "extra name" we
+            // can quietly ignore.
+            let identifiers = dns(&["example.com"]);
+            assert!(matches!(
+                check(EMAIL, &identifiers, false),
+                Err(CsrError::UnexpectedIdentifier(name)) if name == "ops@example.com"
+            ));
+
+            let authorized = identifiers
+                .iter()
+                .map(|identifier| identifier.authorized(false))
+                .collect::<Vec<_>>();
+            let policy = CsrPolicy::new().allow_extra_identifiers(true);
+            Csr::from_der(EMAIL)
+                .validate_with(&authorized, &policy)
+                .unwrap();
         }
 
         #[cfg(all(feature = "rcgen", any(feature = "aws-lc-rs", feature = "ring")))]
