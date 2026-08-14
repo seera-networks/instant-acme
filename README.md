@@ -39,8 +39,9 @@ specification.
 * `fips`: enable the aws-lc-rs crate's FIPS-compliant mode
 * `fs`: enable APIs that read from the filesystem, like `Csr::from_pem_file()`
   (implied by `hyper-rustls`)
-* `rcgen`: enable `Order::finalize()`, which generates a key pair and a CSR for you.
-  Without it, generate the CSR yourself and use `Order::finalize_with()`
+* `rcgen` (default): enable `Order::finalize()`, which generates a key pair and a CSR for
+  you (also needs `aws-lc-rs` or `ring`). Turn it off to keep key generation code out of
+  your build: generate the CSR yourself and use `Order::finalize_with()`
 * `x509-parser`: enable extracting `CertificateIdentifier` values for ARI from
   certificates
 * `time`: enable fetching `RenewalInfo` for a `CertificateIdentifier`

@@ -1166,7 +1166,11 @@ pub(crate) struct Empty {}
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "x509-parser", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[cfg(all(
+        feature = "rcgen",
+        feature = "x509-parser",
+        any(feature = "aws-lc-rs", feature = "ring")
+    ))]
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, IsCa, Issuer, KeyIdMethod, KeyPair,
         SerialNumber,
@@ -1422,7 +1426,11 @@ mod tests {
         assert_eq!(serialized, r#""aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE""#);
     }
 
-    #[cfg(all(feature = "x509-parser", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[cfg(all(
+        feature = "rcgen",
+        feature = "x509-parser",
+        any(feature = "aws-lc-rs", feature = "ring")
+    ))]
     #[test]
     fn encoded_certificate_identifier_from_cert() {
         // Generate a CA key_pair and self-signed cert with a specific subject key identifier.

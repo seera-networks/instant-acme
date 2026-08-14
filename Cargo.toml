@@ -12,7 +12,7 @@ keywords = ["letsencrypt", "acme"]
 categories = ["web-programming", "api-bindings"]
 
 [features]
-default = ["aws-lc-rs", "hyper-rustls"]
+default = ["aws-lc-rs", "hyper-rustls", "rcgen"]
 aws-lc-rs = ["dep:aws-lc-rs", "hyper-rustls?/aws-lc-rs", "rcgen?/aws_lc_rs"]
 fips = ["aws-lc-rs", "aws-lc-rs?/fips"]
 # Enable APIs that read from the filesystem, like `Csr::from_pem_file()`.
