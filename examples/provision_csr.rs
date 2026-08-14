@@ -13,14 +13,19 @@
 //! Then, with the names matching the CSR's subjectAltName values:
 //!
 //! ```sh
-//! cargo run --example provision_csr -- --names example.com --names www.example.com \
-//!     --csr server.csr
+//! cargo run --features x509-parser --example provision_csr -- \
+//!     --names example.com --names www.example.com --csr server.csr
 //! ```
+//!
+//! The `x509-parser` feature is what enables the pre-flight check of the CSR against the order.
+//! It is worth having: without it, a CSR that does not match the names is only rejected once
+//! the challenges have been solved, and the order is spent by then.
 //!
 //! `--directory` and `--ca-cert` point it at another CA, such as a local Pebble:
 //!
 //! ```sh
-//! cargo run --example provision_csr -- --names example.com --csr server.csr \
+//! cargo run --features x509-parser --example provision_csr -- \
+//!     --names example.com --csr server.csr \
 //!     --directory https://127.0.0.1:14000/dir --ca-cert tests/testdata/ca.pem
 //! ```
 
@@ -92,11 +97,14 @@ async fn main() -> anyhow::Result<()> {
         .new_order(&NewOrder::new(identifiers.as_slice()))
         .await?;
 
-    // Catch a CSR that does not match this order before spending the order on it. Without the
-    // `x509-parser` feature this check is unavailable, and a mismatch surfaces as a `badCSR`
-    // problem from the server at finalization time instead.
+    // Catch a CSR that does not match this order before spending the order on it.
     #[cfg(feature = "x509-parser")]
     order.validate_csr(&csr).await?;
+
+    // Built without `--features x509-parser`, so a mismatch between `--names` and the CSR will
+    // only surface as a `badCSR` problem at finalization, after the challenges are solved.
+    #[cfg(not(feature = "x509-parser"))]
+    tracing::warn!("built without the `x509-parser` feature: not checking the CSR up front");
 
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {

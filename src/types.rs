@@ -390,7 +390,8 @@ impl<'a> Csr<'a> {
             }
         }
 
-        if !has_san && !(wanted_dns.is_empty() && wanted_ips.is_empty()) {
+        let wants_names = !wanted_dns.is_empty() || !wanted_ips.is_empty();
+        if wants_names && !has_san {
             return Err(CsrError::NoSubjectAltName);
         }
 
