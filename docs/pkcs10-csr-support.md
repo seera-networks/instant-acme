@@ -186,7 +186,9 @@ impl Csr<'_> {
 3. **余剰 SAN の検出** — CSR にオーダー外の名前があると CA は拒否する。エラーにするか警告に留めるかは要検討（デフォルトはエラー、`allow_extra_names()` で緩和）。
 4. **CN の扱い** — Subject CN があるのに SAN に無い場合、Boulder は拒否する。検出してエラーにする。
 5. **アカウント鍵の再利用禁止**（RFC 8555 §11.1）— CSR の公開鍵がアカウント鍵と一致したらエラー。やらかすと CA から拒否され原因が分かりにくいので実利は大きい。`Order::validate_csr()` でのみ実施。実装は CSR の SubjectPublicKeyInfo からアカウント鍵と同じ表現（JWK サムプリント等）を導いて比較する形になるため、instant-acme が JWK 化できる鍵種別（現状 P-256）以外では比較をスキップする。
-6. **署名検証**（任意）— `verify_signature()`。`x509-parser` の `verify` / `verify-aws` feature が要るため、instant-acme 側で `x509-parser?/verify-aws`（`aws-lc-rs` 有効時）/ `x509-parser?/verify`（`ring` 有効時）へマッピングする。既存の `rcgen/aws_lc_rs`・`rcgen/ring` と同じ書き方で `Cargo.toml` の `[features]` に足せる。
+6. **署名検証**（best-effort）— `verify_signature()`。`x509-parser` の `verify` / `verify-aws` feature が要るため、instant-acme 側で `x509-parser?/verify-aws`（`aws-lc-rs` 有効時）/ `x509-parser?/verify`（`ring` 有効時）へマッピングする。
+   - **検証できない場合はスキップする**（#3 で決定）。バックエンド feature が無い構成には検証器が無く、また x509-parser が未実装の署名アルゴリズム（`ecdsa-with-SHA512`、P-521、RSA-PSS/SHA-1 など）では `SignatureUnsupportedAlgorithm` が返る。これらを「署名が不正」として扱うと、CA が受理する正当な CSR を発行前に弾いてしまうため、`BadSignature` は本当に検証に失敗した場合だけに限る。
+   - 結果として `validate_csr()` は「通れば CA も受理する」保証ではなく「明らかな不整合を事前に潰す」ものになる。この非対称性（誤検知はしない / 検知漏れはありうる）は 5 のアカウント鍵チェックと同じ方針で、rustdoc に明記する。
 
 **呼び出しタイミングの設計上の論点**: `finalize_with` が feature 有効時に暗黙で `validate()` を呼ぶ設計は、Cargo の feature unification によって「別のクレートが `x509-parser` を有効化したせいで挙動が変わる」問題を招く。したがって**暗黙呼び出しはしない**。検証は呼び出し側が明示的に行い、ドキュメントとサンプルで強く推奨する。
 
@@ -274,25 +276,28 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
 
 ### PR 1: CSR 入力の型付け（フェーズ 1）
 
-- [ ] `Csr<'a>` を実装（`from_der` / `from_pem` / `from_pem_file` / `der`）
-- [ ] `Order::finalize_with(&mut self, csr: &Csr<'_>)` を追加、`finalize_csr` をラッパ化
-- [ ] `Cargo.toml` の `rustls-pki-types` を `CertificateSigningRequestDer` が入るバージョン以上に引き上げ
-- [ ] `fs = ["rustls-pki-types/std"]` を追加し、`Csr::from_pem_file` をゲート。`hyper-rustls` feature に `fs` を追加して `src/lib.rs:239` の暗黙の `std` 依存を明示化
-- [ ] `Cargo.toml` の `aws-lc-rs` / `ring` feature を `rcgen/...` から **`rcgen?/...`** に修正（optional な `rcgen` を巻き込まないようにする）
-- [ ] `cargo check-external-types` が通ることを確認（`rustls_pki_types::*` は許可済み）
-- [ ] PEM 入力の unit テスト（固定フィクスチャの PEM をデコードした結果が、対応する DER フィクスチャと一致すること）
-- [ ] feature 組み合わせのビルド確認
+完了（#2）。
+
+- [x] `Csr<'a>` を実装（`from_der` / `from_pem` / `from_pem_file` / `der`）
+- [x] `Order::finalize_with(&mut self, csr: &Csr<'_>)` を追加、`finalize_csr` をラッパ化
+- [x] `Cargo.toml` の `rustls-pki-types` を `CertificateSigningRequestDer` が入るバージョン以上に引き上げ（1.12.0）
+- [x] `fs = ["rustls-pki-types/std"]` を追加し、`Csr::from_pem_file` をゲート。`hyper-rustls` feature に `fs` を追加して `src/lib.rs:239` の暗黙の `std` 依存を明示化
+- [x] `Cargo.toml` の `aws-lc-rs` / `ring` feature を `rcgen/...` から **`rcgen?/...`** に修正（optional な `rcgen` を巻き込まないようにする）。あわせて `rcgen` を `default` に追加し、既定 feature 利用者から `Order::finalize()` が消えないようにした
+- [ ] `cargo check-external-types` が通ることを確認（`rustls_pki_types::*` は許可済み。ローカル未実行、CI 待ち）
+- [x] PEM 入力の unit テスト（固定フィクスチャの PEM をデコードした結果が、対応する DER フィクスチャと一致すること）
+- [x] feature 組み合わせのビルド確認
   - `--no-default-features --features aws-lc-rs`（`fs` なし。`from_pem` は使え、`from_pem_file` は生えないこと）
   - `--no-default-features --features aws-lc-rs,fs`（HTTP クライアント持ち込みでもファイル API が使えること）
   - `--no-default-features --features hyper-rustls,aws-lc-rs`（`cargo tree -e features | grep rcgen` が空になること。修正前は `rcgen v0.14.7` が入る）
 
 ### PR 2: 検証（フェーズ 2）
 
-- [ ] `CsrError` と `Order::validate_csr()` / `Csr::validate(&[AuthorizedIdentifier])` を実装（`x509-parser` feature）、`Error::Csr` variant を追加
-- [ ] SAN カバレッジ / 余剰 SAN / CN 整合 / アカウント鍵再利用 / 署名検証
-- [ ] `Cargo.toml` の feature 伝播（`aws-lc-rs = [..., "x509-parser?/verify-aws"]`、`ring = [..., "x509-parser?/verify"]`）
-- [ ] フィクスチャベースの unit テスト（正常系 + 不正系 4 種）
-- [ ] ワイルドカード（`*.example.com`）と IPv6 identifier の比較テスト
+- [x] `CsrError` と `Order::validate_csr()` / `Csr::validate(&[AuthorizedIdentifier])` を実装（`x509-parser` feature）、`Error::Csr` variant を追加
+- [x] SAN カバレッジ / 余剰 SAN / CN 整合 / アカウント鍵再利用 / 署名検証
+- [x] `Cargo.toml` の feature 伝播（`aws-lc-rs = [..., "x509-parser?/verify-aws"]`、`ring = [..., "x509-parser?/verify"]`）
+- [x] フィクスチャベースの unit テスト（正常系 + 不正系 4 種）
+- [x] ワイルドカード（`*.example.com`）と IPv6 identifier の比較テスト
+- [x] 余剰 SAN の緩和オプション `CsrPolicy::allow_extra_identifiers()` を追加（§8-2 への対応）
 
 ### PR 3: サンプルとドキュメント（フェーズ 3）
 
@@ -333,31 +338,34 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
 
 ## 7. 互換性・リリース
 
-- **semver**: 案 C を採る限りすべて純粋な追加。`Error` は既に `#[non_exhaustive]`（`src/types.rs:23-26`）なので `Error::Csr` の追加も非破壊。ただし `rcgen/...` → `rcgen?/...` の修正は、これまで暗黙に `rcgen` が有効化されていたことに依存していた下流をビルドエラーにしうる（`Order::finalize()` が消える）。0.10.0 に含めるか、CHANGELOG で明示する。
+- **semver**: 案 C を採ったのですべて純粋な追加。`Error` は既に `#[non_exhaustive]`（`src/types.rs:23-26`）なので `Error::Pem` / `Error::Csr` の追加も非破壊。`rcgen/...` → `rcgen?/...` の修正は下流から `Order::finalize()` を消しうる破壊的変更だったため、**`rcgen` を `default` に追加**して回避した（#2）。既定 feature の利用者には影響がなく、鍵生成を外したいビルドは `--no-default-features` でオプトアウトする。
 - **MSRV**: 現在 1.85。新しい言語機能は不要なので据え置き。
 - **依存**: 新規クレートの追加なし。`rustls-pki-types` の最低バージョン引き上げと、新 feature `fs` からの `rustls-pki-types/std` 有効化のみ。既定構成では `std` は `rustls` 経由で既に有効なため実質的な増分は無い。`fs` は既定では無効（`hyper-rustls` を使う既定構成では連動して有効）。
 - **feature 表**（更新後の想定）
 
   | feature | CSR 経路への影響 |
   | --- | --- |
-  | （なし） | `Csr::from_der` / `from_pem`（バイト列）/ `finalize_with` が使える。**`rcgen?/...` への修正後は**鍵生成コードがリンクされない |
-  | `fs` | `Csr::from_pem_file()` が使える（`rustls-pki-types/std` を有効化） |
-  | `x509-parser` | `Order::validate_csr()` / `Csr::validate()` が使える |
-  | `x509-parser` + `aws-lc-rs` / `ring` | 上記に加えて CSR 署名検証が有効 |
-  | `rcgen` + バックエンド | 従来どおり `Order::finalize()` による鍵自動生成も使える |
+  | （なし） | `Csr::from_der` / `from_pem`（バイト列）/ `finalize_with` が使える。鍵生成コードはリンクされない |
+  | `fs`（`hyper-rustls` が含む） | `Csr::from_pem_file()` が使える（`rustls-pki-types/std` を有効化） |
+  | `x509-parser` | `Order::validate_csr()` / `Csr::validate()` / `CsrPolicy` / `CsrError` が使える |
+  | `x509-parser` + `aws-lc-rs` / `ring` | 上記に加えて CSR 署名検証が有効（`x509-parser?/verify-aws` / `?/verify` を伝播）。バックエンドが無い構成では検証だけがスキップされる |
+  | `rcgen`（既定で有効） + バックエンド | 従来どおり `Order::finalize()` による鍵自動生成も使える |
 
 ---
 
 ## 8. リスクと未決事項
 
-1. **検証を暗黙にするか明示にするか** — 本書は明示（`Order::validate_csr()` を呼ぶのは利用者）を推奨。feature unification による挙動変化を避けるため。上流の意見次第では、`finalize_with` に `CsrPolicy` 引数を持たせる案（デフォルトで検証あり、feature 無効時はコンパイルエラーではなく検証スキップ）も検討余地あり。
-2. **余剰 SAN の扱い** — CA によって挙動が違う（Boulder は identifier と SAN の完全一致を要求、他の CA は緩い）。デフォルトを厳格にすると一部 CA で使えなくなる可能性があるため、緩和オプションを最初から用意する。
+1. **検証を暗黙にするか明示にするか** — **決定済み（#3）**: 明示。`Order::validate_csr()` を呼ぶのは利用者で、`finalize_with()` は検証しない。feature unification により「別クレートが `x509-parser` を有効化したせいで挙動が変わる」ことを避けるため。
+2. **余剰 SAN の扱い** — **対応済み（#3）**: デフォルトは厳格（オーダー外の名前はエラー）、`CsrPolicy::allow_extra_identifiers(true)` で緩和できる。
 3. **`rustls-pki-types` の `CertificateSigningRequestDer` 導入バージョン** — 1.12.0 に存在することは手元のソースで確認済み。それ以前のどこで入ったかは crates.io で確認して最低バージョンを決める。必要以上に上げると下流の解決に影響する。
-4. **`x509-parser` の `verify` feature が `ring` を引き込む** — instant-acme が `aws-lc-rs` のみ構成のとき、誤って `verify`（ring 版）を有効にすると ring が余計にリンクされる。feature マッピングを間違えないこと。テストで `cargo tree` を確認する。なお両方有効でも `verify-aws` が優先されるためビルドは壊れない。
+4. **`x509-parser` の `verify` feature が `ring` を引き込む** — **確認済み（#3）**: `aws-lc-rs = [..., "x509-parser?/verify-aws"]` / `ring = [..., "x509-parser?/verify"]` の伝播で、`--no-default-features --features aws-lc-rs,x509-parser` に ring は入らない（`cargo tree` で確認）。両方有効でも `verify-aws` が優先されるためビルドは壊れない。
 5. **rcgen の同期 `sign` と非同期 KMS** — 本体の課題ではないがユーザが必ず踏む。サンプルに `spawn_blocking` パターンを含める。ここを避けたい場合は「CSR は別プロセス/別ツールで作る」ことを推奨経路として提示する。
 6. **`Order::finalize()` の非推奨化** — 鍵を返す API はメモリ上に秘密鍵を載せるため、CSR 経路が整った後は「テスト・デモ向け」と位置づけを明記したい。ただし既存利用者が多いはずなので削除はしない。ドキュメントでの誘導に留める。
 7. **`fs` という feature 名** — `pem-file` / `file` / `paths` なども候補。`fs` は「ファイルシステムに触る API 群」を表す語として一般的で、将来ファイル系ヘルパが増えても収まる点を評価して推している。`std` は instant-acme が元々 std 必須である以上、誤解を招くので避ける。上流に出す前に名前を合意する。また `hyper-rustls` に `fs` を含める変更は、`hyper-rustls` 単体を有効にしていた利用者にとって feature が 1 つ増えるだけで API は変わらないため非破壊。
-8. **`rcgen?/...` への変更の是非** — 「`aws-lc-rs` を有効にすると `rcgen` も有効になる」現状の挙動は、`Order::finalize()` を常に使えるようにする意図的な設計かもしれない。上流に出す前に Issue で意図を確認する。少なくとも当リポジトリ（seera-networks fork）では鍵生成コードを含めない構成を取れるようにしたい。
+8. **`rcgen?/...` への変更の是非** — 「`aws-lc-rs` を有効にすると `rcgen` も有効になる」現状の挙動は、`Order::finalize()` を常に使えるようにする意図的な設計かもしれない。上流に出す前に Issue で意図を確認する。当リポジトリでは `?` 付き + `default` 入りとし、`--no-default-features` でオプトアウトできる形に落ち着いた（#2）。
+9. **アカウント鍵再利用チェックの適用範囲** — CSR の公開鍵とアカウント鍵の比較は、instant-acme が JWK として表現できる鍵種別（EC / OKP / RSA）でのみ成立する。SPKI を JWK に変換できない鍵種別では比較が成立せず「再利用ではない」と判定される。誤検知はしないが検知漏れはありうる、という非対称性は仕様として受け入れる。
+10. **subjectAltName の DNS / IP 以外の名前** — 決定済み（#3）: `otherName` は attestation identifier の運び先なので無視し、それ以外（`rfc822Name`、`URI` など）は既定でエラー（`UnexpectedIdentifier`）にする。Boulder はこれらを含む CSR を拒否するため、黙って通すと事前検証の意味がない。`CsrPolicy::allow_extra_identifiers(true)` で緩和できる。
+11. **`CsrError::Parse` が `&'static str` を持つ** — x509-parser のエラー型は `allowed_external_types` に無いため公開 API に出せず、パース失敗の詳細は固定文言に落としている。詳細が必要になったら `Box<dyn Error>` を持たせるか、x509-parser を許可リストに追加するかを検討する。
 
 ---
 

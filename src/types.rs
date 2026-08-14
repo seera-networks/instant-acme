@@ -15,9 +15,15 @@ use thiserror::Error;
 #[cfg(feature = "time")]
 use time::OffsetDateTime;
 #[cfg(feature = "x509-parser")]
-use x509_parser::extensions::ParsedExtension;
+use x509_parser::certification_request::X509CertificationRequest;
+#[cfg(feature = "x509-parser")]
+use x509_parser::extensions::{GeneralName, ParsedExtension};
 #[cfg(feature = "x509-parser")]
 use x509_parser::parse_x509_certificate;
+#[cfg(feature = "x509-parser")]
+use x509_parser::prelude::FromDer;
+#[cfg(feature = "x509-parser")]
+use x509_parser::public_key::PublicKey;
 
 use crate::{BytesResponse, Sha256};
 
@@ -33,6 +39,11 @@ pub enum Error {
     /// Failed from cryptographic operations
     #[error("cryptographic operation failed")]
     Crypto,
+    /// A CSR does not match the order it was passed for
+    #[cfg(feature = "x509-parser")]
+    #[cfg_attr(instant_acme_docsrs, doc(cfg(feature = "x509-parser")))]
+    #[error(transparent)]
+    Csr(#[from] CsrError),
     /// Failed to instantiate a private key
     #[error("invalid key bytes")]
     KeyRejected,
@@ -294,10 +305,266 @@ impl<'a> Csr<'a> {
         Ok(Csr(CertificateSigningRequestDer::from_pem_file(path)?))
     }
 
+    /// Check this CSR against an order's identifiers, with the default [`CsrPolicy`]
+    ///
+    /// This is what [`Order::validate_csr()`][crate::Order::validate_csr()] uses; prefer that
+    /// method, which also has access to the order's wildcard bits and to the account key.
+    /// Use this one to check a CSR before you have an order, or in an offline tool.
+    #[cfg(feature = "x509-parser")]
+    #[cfg_attr(instant_acme_docsrs, doc(cfg(feature = "x509-parser")))]
+    pub fn validate(&self, identifiers: &[AuthorizedIdentifier<'_>]) -> Result<(), CsrError> {
+        self.validate_with(identifiers, &CsrPolicy::default())
+    }
+
+    /// Check this CSR against an order's identifiers, with the given [`CsrPolicy`]
+    ///
+    /// Nothing here talks to the ACME server: this is the same set of checks a CA applies,
+    /// run locally, so that a mismatch costs you a helpful error instead of a failed
+    /// finalization (and one of your rate-limited orders).
+    #[cfg(feature = "x509-parser")]
+    #[cfg_attr(instant_acme_docsrs, doc(cfg(feature = "x509-parser")))]
+    pub fn validate_with(
+        &self,
+        identifiers: &[AuthorizedIdentifier<'_>],
+        policy: &CsrPolicy,
+    ) -> Result<(), CsrError> {
+        let request = self.parse()?;
+
+        // The names the order authorizes us to ask for. Attestation identifiers are not
+        // expressed as subjectAltName values we could compare, so we skip them here.
+        let (mut wanted_dns, mut wanted_ips) = (Vec::new(), Vec::new());
+        for identifier in identifiers {
+            match (identifier.identifier, identifier.wildcard) {
+                (Identifier::Dns(name), true) => {
+                    wanted_dns.push(format!("*.{}", name.to_ascii_lowercase()))
+                }
+                (Identifier::Dns(name), false) => wanted_dns.push(name.to_ascii_lowercase()),
+                (Identifier::Ip(addr), _) => wanted_ips.push(*addr),
+                _ => {}
+            }
+        }
+
+        // The names the CSR asks for.
+        let (mut dns, mut ips, mut has_san) = (Vec::new(), Vec::new(), false);
+        let mut other = Vec::new();
+        for extension in request.requested_extensions().into_iter().flatten() {
+            let ParsedExtension::SubjectAlternativeName(san) = extension else {
+                continue;
+            };
+
+            has_san = true;
+            for name in &san.general_names {
+                match name {
+                    GeneralName::DNSName(name) => dns.push(name.to_ascii_lowercase()),
+                    GeneralName::IPAddress(bytes) => ips.push(match <[u8; 4]>::try_from(*bytes) {
+                        Ok(octets) => IpAddr::from(octets),
+                        Err(_) => match <[u8; 16]>::try_from(*bytes) {
+                            Ok(octets) => IpAddr::from(octets),
+                            Err(_) => {
+                                return Err(CsrError::Parse(
+                                    "invalid IP address in subjectAltName",
+                                ));
+                            }
+                        },
+                    }),
+                    // An `otherName` is how attestation identifiers travel, and an ACME order
+                    // for those does not name them in a way we could compare. Leave those be.
+                    GeneralName::OtherName(..) => {}
+                    // Anything else is a name no ACME order authorizes, and a CA will reject
+                    // the CSR over it. Remember it so the policy below can complain.
+                    GeneralName::RFC822Name(name) | GeneralName::URI(name) => {
+                        other.push((*name).to_owned())
+                    }
+                    _ => other.push(format!("{name:?}")),
+                }
+            }
+        }
+
+        if !has_san && !(wanted_dns.is_empty() && wanted_ips.is_empty()) {
+            return Err(CsrError::NoSubjectAltName);
+        }
+
+        for name in &wanted_dns {
+            if !dns.contains(name) {
+                return Err(CsrError::MissingIdentifier(name.clone()));
+            }
+        }
+
+        for addr in &wanted_ips {
+            if !ips.contains(addr) {
+                return Err(CsrError::MissingIdentifier(addr.to_string()));
+            }
+        }
+
+        if !policy.allow_extra_identifiers {
+            for name in &dns {
+                if !wanted_dns.contains(name) {
+                    return Err(CsrError::UnexpectedIdentifier(name.clone()));
+                }
+            }
+
+            for addr in &ips {
+                if !wanted_ips.contains(addr) {
+                    return Err(CsrError::UnexpectedIdentifier(addr.to_string()));
+                }
+            }
+
+            if let Some(name) = other.first() {
+                return Err(CsrError::UnexpectedIdentifier(name.clone()));
+            }
+        }
+
+        // A subject common name that is not also a subjectAltName gets the CSR rejected by
+        // (at least) Boulder, so catch it here rather than at finalization.
+        for attribute in request
+            .certification_request_info
+            .subject
+            .iter_common_name()
+        {
+            let name = attribute
+                .as_str()
+                .map_err(|_| CsrError::Parse("subject common name is not a string"))?;
+            let lowercase = name.to_ascii_lowercase();
+            let covered = dns.contains(&lowercase)
+                // A common name holding an IP address needs the same normalization the
+                // subjectAltName values get: `2001:DB8::1` and `2001:db8::1` are one address.
+                || name.parse().is_ok_and(|addr| ips.contains(&addr));
+            if !covered {
+                return Err(CsrError::CommonNameNotInSan(name.to_owned()));
+            }
+        }
+
+        // Signature verification uses x509-parser's `verify`/`verify-aws` feature, which our
+        // backend features turn on for us. Without a backend there is nothing to verify with,
+        // and the check is skipped; see the `Order::validate_csr()` docs.
+        #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+        if let Err(err) = request.verify_signature() {
+            // An algorithm x509-parser cannot check is not evidence of a bad signature: the
+            // CA may well accept the CSR (`ecdsa-with-SHA512` and P-521, for two). Rejecting
+            // it here would block issuance for a CSR that is fine.
+            if err != x509_parser::error::X509Error::SignatureUnsupportedAlgorithm {
+                return Err(CsrError::BadSignature);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Yield an error if this CSR's public key is the given account key (RFC 8555 section 11.1)
+    #[cfg(feature = "x509-parser")]
+    pub(crate) fn check_account_key(&self, key: &crate::Key) -> Result<(), CsrError> {
+        let request = self.parse()?;
+        let spki = &request.certification_request_info.subject_pki;
+        let same = match (key.inner.as_jwk().key, spki.parsed()) {
+            (JwkThumbFields::Ec { x, y, .. }, Ok(PublicKey::EC(point))) => {
+                // An uncompressed EC point: 0x04 || X || Y.
+                let point = point.data();
+                point.len() == 1 + x.len() + y.len()
+                    && point[0] == 0x04
+                    && &point[1..1 + x.len()] == x
+                    && &point[1 + x.len()..] == y
+            }
+            // Ed25519 and friends: the key is the bit string, with no further structure.
+            (JwkThumbFields::Okp { x, .. }, _) => spki.subject_public_key.data.as_ref() == x,
+            (JwkThumbFields::Rsa { e, n }, Ok(PublicKey::RSA(rsa))) => {
+                trim_leading_zeros(rsa.modulus) == trim_leading_zeros(n)
+                    && trim_leading_zeros(rsa.exponent) == trim_leading_zeros(e)
+            }
+            _ => false,
+        };
+
+        match same {
+            true => Err(CsrError::AccountKeyReuse),
+            false => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "x509-parser")]
+    fn parse(&self) -> Result<X509CertificationRequest<'_>, CsrError> {
+        let (rest, request) = X509CertificationRequest::from_der(self.der())
+            .map_err(|_| CsrError::Parse("not a valid PKCS#10 certification request"))?;
+
+        match rest.is_empty() {
+            true => Ok(request),
+            false => Err(CsrError::Parse(
+                "trailing data after the certification request",
+            )),
+        }
+    }
+
     /// The DER encoding of the CSR
     pub fn der(&self) -> &[u8] {
         &self.0
     }
+}
+
+/// How strictly a CSR is checked against an order
+///
+/// Used by [`Csr::validate_with()`] and
+/// [`Order::validate_csr_with()`][crate::Order::validate_csr_with()].
+#[cfg(feature = "x509-parser")]
+#[cfg_attr(instant_acme_docsrs, doc(cfg(feature = "x509-parser")))]
+#[derive(Clone, Debug, Default)]
+pub struct CsrPolicy {
+    allow_extra_identifiers: bool,
+}
+
+#[cfg(feature = "x509-parser")]
+impl CsrPolicy {
+    /// A `CsrPolicy` that requires the CSR's names to match the order's identifiers exactly
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accept a CSR that asks for names the order does not cover
+    ///
+    /// Off by default, because an ACME server will not issue for identifiers you have no
+    /// authorization for: Boulder, for one, rejects the CSR outright. Turn it on for servers
+    /// that are known to ignore the extra names instead.
+    pub fn allow_extra_identifiers(mut self, allow: bool) -> Self {
+        self.allow_extra_identifiers = allow;
+        self
+    }
+}
+
+/// The ways a CSR can fail to match an order
+#[cfg(feature = "x509-parser")]
+#[cfg_attr(instant_acme_docsrs, doc(cfg(feature = "x509-parser")))]
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CsrError {
+    /// The CSR's public key is the ACME account key
+    ///
+    /// <https://www.rfc-editor.org/rfc/rfc8555#section-11.1>
+    #[error("the CSR's public key is the ACME account key")]
+    AccountKeyReuse,
+    /// The CSR's signature does not verify against the key in the CSR
+    #[error("the CSR's signature does not verify")]
+    BadSignature,
+    /// The CSR has a subject common name that is not among its subjectAltName values
+    #[error("common name `{0}` is missing from the CSR's subjectAltName extension")]
+    CommonNameNotInSan(String),
+    /// The order has an identifier that the CSR does not ask for
+    #[error("the CSR does not cover identifier `{0}`")]
+    MissingIdentifier(String),
+    /// The CSR has no subjectAltName extension, but the order has identifiers
+    #[error("the CSR has no subjectAltName extension")]
+    NoSubjectAltName,
+    /// The CSR could not be parsed
+    #[error("failed to parse the CSR: {0}")]
+    Parse(&'static str),
+    /// The CSR asks for a name that the order does not authorize
+    ///
+    /// See [`CsrPolicy::allow_extra_identifiers()`] to allow this.
+    #[error("the CSR asks for identifier `{0}`, which the order does not authorize")]
+    UnexpectedIdentifier(String),
+}
+
+/// Compare integers that may or may not carry a leading zero byte
+#[cfg(feature = "x509-parser")]
+fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
+    let zeros = bytes.iter().take_while(|byte| **byte == 0).count();
+    &bytes[zeros..]
 }
 
 impl<'a> From<&'a [u8]> for Csr<'a> {
@@ -1207,6 +1474,234 @@ mod tests {
         // Truncated: no end marker
         let truncated = &CSR_PEM[..CSR_PEM.len() / 2];
         assert!(matches!(Csr::from_pem(truncated), Err(Error::Pem(_))));
+    }
+
+    #[cfg(feature = "x509-parser")]
+    mod validate {
+        use super::*;
+
+        const WILDCARD: &[u8] = include_bytes!("../tests/testdata/csr-wildcard.der");
+        const CN_OK: &[u8] = include_bytes!("../tests/testdata/csr-cn-ok.der");
+        const CN_MISMATCH: &[u8] = include_bytes!("../tests/testdata/csr-cn-mismatch.der");
+        const IP: &[u8] = include_bytes!("../tests/testdata/csr-ip.der");
+        const NO_SAN: &[u8] = include_bytes!("../tests/testdata/csr-no-san.der");
+        const BAD_SIG: &[u8] = include_bytes!("../tests/testdata/csr-bad-sig.der");
+        const EMPTY: &[u8] = include_bytes!("../tests/testdata/csr-empty.der");
+        const SHA512: &[u8] = include_bytes!("../tests/testdata/csr-sha512.der");
+        const CN_IP: &[u8] = include_bytes!("../tests/testdata/csr-cn-ip.der");
+        const EMAIL: &[u8] = include_bytes!("../tests/testdata/csr-email.der");
+
+        fn dns(names: &[&str]) -> Vec<Identifier> {
+            names
+                .iter()
+                .map(|name| Identifier::Dns((*name).to_owned()))
+                .collect()
+        }
+
+        fn check(der: &[u8], identifiers: &[Identifier], wildcard: bool) -> Result<(), CsrError> {
+            let authorized = identifiers
+                .iter()
+                .map(|identifier| identifier.authorized(wildcard))
+                .collect::<Vec<_>>();
+            Csr::from_der(der).validate(&authorized)
+        }
+
+        #[test]
+        fn exact_match() {
+            let identifiers = dns(&["example.com", "www.example.com"]);
+            check(CSR_DER, &identifiers, false).unwrap();
+        }
+
+        #[test]
+        fn case_insensitive() {
+            let identifiers = dns(&["EXAMPLE.com", "WWW.example.COM"]);
+            check(CSR_DER, &identifiers, false).unwrap();
+        }
+
+        #[test]
+        fn missing_identifier() {
+            let identifiers = dns(&["example.com", "www.example.com", "other.example.com"]);
+            assert!(matches!(
+                check(CSR_DER, &identifiers, false),
+                Err(CsrError::MissingIdentifier(name)) if name == "other.example.com"
+            ));
+        }
+
+        #[test]
+        fn unexpected_identifier() {
+            let identifiers = dns(&["example.com"]);
+            assert!(matches!(
+                check(CSR_DER, &identifiers, false),
+                Err(CsrError::UnexpectedIdentifier(name)) if name == "www.example.com"
+            ));
+
+            // ...unless the policy allows it
+            let authorized = identifiers
+                .iter()
+                .map(|identifier| identifier.authorized(false))
+                .collect::<Vec<_>>();
+            let policy = CsrPolicy::new().allow_extra_identifiers(true);
+            Csr::from_der(CSR_DER)
+                .validate_with(&authorized, &policy)
+                .unwrap();
+        }
+
+        #[test]
+        fn wildcard() {
+            // The authorization identifier for `*.example.com` is `example.com` plus the
+            // wildcard bit, so this only matches if the bit is taken into account.
+            let identifiers = dns(&["example.com"]);
+            check(WILDCARD, &identifiers, true).unwrap();
+            assert!(matches!(
+                check(WILDCARD, &identifiers, false),
+                Err(CsrError::MissingIdentifier(name)) if name == "example.com"
+            ));
+        }
+
+        #[test]
+        fn ip_identifiers() {
+            // Written as `2001:db8::1` in the CSR, spelled out here: comparing as text would
+            // not match.
+            let identifiers = vec![
+                Identifier::Ip("127.0.0.1".parse().unwrap()),
+                Identifier::Ip("2001:0db8:0000:0000:0000:0000:0000:0001".parse().unwrap()),
+            ];
+            check(IP, &identifiers, false).unwrap();
+
+            let identifiers = vec![Identifier::Ip("127.0.0.2".parse().unwrap())];
+            assert!(matches!(
+                check(IP, &identifiers, false),
+                Err(CsrError::MissingIdentifier(_))
+            ));
+        }
+
+        #[test]
+        fn common_name() {
+            let identifiers = dns(&["example.com", "www.example.com"]);
+            check(CN_OK, &identifiers, false).unwrap();
+
+            let identifiers = dns(&["example.com"]);
+            assert!(matches!(
+                check(CN_MISMATCH, &identifiers, false),
+                Err(CsrError::CommonNameNotInSan(name)) if name == "other.example.com"
+            ));
+        }
+
+        #[test]
+        fn no_subject_alt_name() {
+            let identifiers = dns(&["example.com"]);
+            assert!(matches!(
+                check(NO_SAN, &identifiers, false),
+                Err(CsrError::NoSubjectAltName)
+            ));
+
+            // That CSR puts the name in the subject instead, which is the other half of why
+            // a CA rejects it.
+            assert!(matches!(
+                check(NO_SAN, &[], false),
+                Err(CsrError::CommonNameNotInSan(name)) if name == "example.com"
+            ));
+
+            // With no identifiers to cover, a CSR without the extension is not a problem.
+            check(EMPTY, &[], false).unwrap();
+        }
+
+        #[test]
+        fn not_a_csr() {
+            assert!(matches!(
+                check(CSR_PEM, &[], false),
+                Err(CsrError::Parse(_))
+            ));
+
+            let mut trailing = CSR_DER.to_vec();
+            trailing.push(0);
+            assert!(matches!(
+                check(&trailing, &[], false),
+                Err(CsrError::Parse(
+                    "trailing data after the certification request"
+                ))
+            ));
+        }
+
+        #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+        #[test]
+        fn bad_signature() {
+            let identifiers = dns(&["example.com", "www.example.com"]);
+            assert!(matches!(
+                check(BAD_SIG, &identifiers, false),
+                Err(CsrError::BadSignature)
+            ));
+        }
+
+        #[test]
+        fn unsupported_signature_algorithm() {
+            // A P-256 CSR signed with `ecdsa-with-SHA512`: a CA will take it, but x509-parser
+            // has no verifier for that OID. Not being able to check the signature is not the
+            // same as the signature being wrong, so this must not fail validation.
+            let identifiers = dns(&["example.com"]);
+            check(SHA512, &identifiers, false).unwrap();
+        }
+
+        #[test]
+        fn common_name_as_ip() {
+            // The common name spells the address differently than the subjectAltName does.
+            let identifiers = vec![Identifier::Ip("2001:db8::1".parse().unwrap())];
+            check(CN_IP, &identifiers, false).unwrap();
+        }
+
+        #[test]
+        fn other_name_types() {
+            // An email SAN gets the CSR rejected by the CA, so it is not an "extra name" we
+            // can quietly ignore.
+            let identifiers = dns(&["example.com"]);
+            assert!(matches!(
+                check(EMAIL, &identifiers, false),
+                Err(CsrError::UnexpectedIdentifier(name)) if name == "ops@example.com"
+            ));
+
+            let authorized = identifiers
+                .iter()
+                .map(|identifier| identifier.authorized(false))
+                .collect::<Vec<_>>();
+            let policy = CsrPolicy::new().allow_extra_identifiers(true);
+            Csr::from_der(EMAIL)
+                .validate_with(&authorized, &policy)
+                .unwrap();
+        }
+
+        #[cfg(all(feature = "rcgen", any(feature = "aws-lc-rs", feature = "ring")))]
+        #[test]
+        fn account_key_reuse() {
+            use rustls_pki_types::PrivatePkcs8KeyDer;
+
+            #[cfg(feature = "aws-lc-rs")]
+            let provider = crate::CryptoProvider::aws_lc_rs();
+            #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+            let provider = crate::CryptoProvider::ring();
+
+            // A CSR signed with the same key pair the account uses is not acceptable.
+            let key_pair = KeyPair::generate().unwrap();
+            let account_key = crate::Key::from_pkcs8_der(
+                PrivatePkcs8KeyDer::from(key_pair.serialized_der().to_vec()),
+                provider,
+            )
+            .unwrap();
+
+            let mut params = CertificateParams::new(vec!["example.com".to_owned()]).unwrap();
+            params.distinguished_name = DistinguishedName::new();
+            let csr = params.serialize_request(&key_pair).unwrap();
+            assert!(matches!(
+                Csr::from(csr.der()).check_account_key(&account_key),
+                Err(CsrError::AccountKeyReuse)
+            ));
+
+            // A CSR for any other key pair is fine.
+            let other = KeyPair::generate().unwrap();
+            let csr = params.serialize_request(&other).unwrap();
+            Csr::from(csr.der())
+                .check_account_key(&account_key)
+                .unwrap();
+        }
     }
 
     #[cfg(feature = "fs")]

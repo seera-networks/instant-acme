@@ -13,13 +13,18 @@ categories = ["web-programming", "api-bindings"]
 
 [features]
 default = ["aws-lc-rs", "hyper-rustls", "rcgen"]
-aws-lc-rs = ["dep:aws-lc-rs", "hyper-rustls?/aws-lc-rs", "rcgen?/aws_lc_rs"]
+aws-lc-rs = [
+    "dep:aws-lc-rs",
+    "hyper-rustls?/aws-lc-rs",
+    "rcgen?/aws_lc_rs",
+    "x509-parser?/verify-aws",
+]
 fips = ["aws-lc-rs", "aws-lc-rs?/fips"]
 # Enable APIs that read from the filesystem, like `Csr::from_pem_file()`.
 fs = ["rustls-pki-types/std"]
 hyper-rustls = ["dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:rustls", "fs"]
 rcgen = ["dep:rcgen"]
-ring = ["dep:ring", "hyper-rustls?/ring", "rcgen?/ring"]
+ring = ["dep:ring", "hyper-rustls?/ring", "rcgen?/ring", "x509-parser?/verify"]
 time = ["dep:time"]
 x509-parser = ["dep:x509-parser"]
 

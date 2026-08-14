@@ -18,7 +18,8 @@ specification.
   * [ACME renewal information (ARI)]
   * [Profiles]
 * Issue from an externally generated PKCS#10 CSR, keeping the certificate's private key
-  out of the process (HSM, KMS, or a key file you never read)
+  out of the process (HSM, KMS, or a key file you never read), with local pre-flight
+  validation of the CSR against the order
 * Support for external account binding, key rollover, and contact updates
 * Support for certificate revocation
 * Store/recover your account credentials by serializing/deserializing
@@ -43,7 +44,7 @@ specification.
   you (also needs `aws-lc-rs` or `ring`). Turn it off to keep key generation code out of
   your build: generate the CSR yourself and use `Order::finalize_with()`
 * `x509-parser`: enable extracting `CertificateIdentifier` values for ARI from
-  certificates
+  certificates, and checking a CSR against an order with `Order::validate_csr()`
 * `time`: enable fetching `RenewalInfo` for a `CertificateIdentifier`
 
 If both `ring` and `aws-lc-rs` are enabled, `aws-lc-rs` will be used.
