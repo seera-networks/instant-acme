@@ -13,7 +13,8 @@ use tokio::time::sleep;
 use crate::account::AccountInner;
 use crate::types::{
     Authorization, AuthorizationState, AuthorizationStatus, AuthorizedIdentifier, Challenge,
-    ChallengeType, DeviceAttestation, Empty, FinalizeRequest, OrderState, OrderStatus, Problem,
+    ChallengeType, Csr, DeviceAttestation, Empty, FinalizeRequest, OrderState, OrderStatus,
+    Problem,
 };
 use crate::{ChallengeStatus, Error, Key, nonce_from_response, retry_after};
 
@@ -56,8 +57,12 @@ impl Order {
     /// Generate a Certificate Signing Request for the order's identifiers and request finalization
     ///
     /// Uses the rcgen crate to generate a Certificate Signing Request (CSR) converting the order's
-    /// identifiers to Subject Alternative Names, then calls [`Order::finalize_csr()`] with it.
+    /// identifiers to Subject Alternative Names, then calls [`Order::finalize_with()`] with it.
     /// Returns the generated private key, serialized as PEM.
+    ///
+    /// This puts the certificate's private key in this process's memory. If the key should stay
+    /// in an HSM, a KMS or a file instantiated elsewhere, generate the CSR there instead and use
+    /// [`Order::finalize_with()`].
     ///
     /// After this succeeds, call [`Order::certificate()`] to retrieve the certificate chain once
     /// the order is in the appropriate state.
@@ -76,22 +81,45 @@ impl Order {
             .serialize_request(&private_key)
             .map_err(Error::from_rcgen)?;
 
-        self.finalize_csr(csr.der()).await?;
+        self.finalize_with(&Csr::from(csr.der())).await?;
         Ok(private_key.serialize_pem())
     }
 
     /// Request a certificate from the given Certificate Signing Request (CSR)
     ///
     /// `csr_der` contains the CSR representation serialized in DER encoding. If you don't need
-    /// custom certificate parameters, [`Order::finalize()`] can generate the CSR for you.
+    /// custom certificate parameters, `Order::finalize()` (with the `rcgen` feature enabled)
+    /// can generate the CSR for you.
     ///
     /// After this succeeds, call [`Order::certificate()`] to retrieve the certificate chain once
     /// the order is in the appropriate state.
+    ///
+    /// Prefer [`Order::finalize_with()`], which takes a [`Csr`] and so also accepts PEM input.
     pub async fn finalize_csr(&mut self, csr_der: &[u8]) -> Result<(), Error> {
+        self.finalize_with(&Csr::from(csr_der)).await
+    }
+
+    /// Request a certificate for the key pair the given CSR was signed with
+    ///
+    /// The private key never reaches instant-acme: generate the CSR wherever the key lives
+    /// (an HSM, a KMS, `openssl req`) and pass the result here. See [`Csr`] for the ways to
+    /// get one, and RFC 8555 section 7.4 for what the ACME server expects it to contain.
+    ///
+    /// After this succeeds, call [`Order::certificate()`] to retrieve the certificate chain once
+    /// the order is in the appropriate state.
+    ///
+    /// ```no_run
+    /// # use instant_acme::{Csr, Error, Order};
+    /// # async fn f(order: &mut Order, csr_pem: &[u8]) -> Result<(), Error> {
+    /// order.finalize_with(&Csr::from_pem(csr_pem)?).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn finalize_with(&mut self, csr: &Csr<'_>) -> Result<(), Error> {
         let rsp = self
             .account
             .post(
-                Some(&FinalizeRequest::new(csr_der)),
+                Some(&FinalizeRequest::new(csr.der())),
                 self.nonce.take(),
                 &self.state.finalize,
             )
@@ -427,7 +455,7 @@ impl Deref for AuthorizationHandle<'_> {
 ///
 /// After the challenges have been set to ready, call [`Order::poll_ready()`] to wait until the
 /// order is ready to be finalized (or to learn if it becomes invalid). Once it is ready, call
-/// [`Order::finalize()`] to get the certificate.
+/// [`Order::finalize_with()`] to get the certificate.
 ///
 /// Dereferences to the underlying [`Challenge`] for easy access to the challenge's state.
 pub struct ChallengeHandle<'a> {

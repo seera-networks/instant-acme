@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
-use rustls_pki_types::{CertificateDer, Der, PrivatePkcs8KeyDer};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, CertificateSigningRequestDer, Der, PrivatePkcs8KeyDer};
 use serde::de::{self, DeserializeOwned};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,13 @@ pub enum Error {
     /// Failed to (de)serialize a JSON object
     #[error("failed to (de)serialize JSON: {0}")]
     Json(#[from] serde_json::Error),
+    /// Failed to decode PEM input
+    ///
+    /// Not marked as the error's `source`: `rustls_pki_types::pem::Error` only implements
+    /// `std::error::Error` when its `std` feature is enabled, which is what our `fs` feature
+    /// turns on.
+    #[error("failed to decode PEM: {0}")]
+    Pem(rustls_pki_types::pem::Error),
     /// Timed out while waiting for the server to update [`OrderStatus`]
     ///
     /// If `Some`, the nested `Instant` indicates when the server suggests to poll next.
@@ -74,6 +82,12 @@ impl Error {
 impl From<&'static str> for Error {
     fn from(s: &'static str) -> Self {
         Self::Str(s)
+    }
+}
+
+impl From<rustls_pki_types::pem::Error> for Error {
+    fn from(err: rustls_pki_types::pem::Error) -> Self {
+        Self::Pem(err)
     }
 }
 
@@ -235,6 +249,89 @@ impl fmt::Display for Subproblem {
         }
 
         Ok(())
+    }
+}
+
+/// A PKCS#10 Certificate Signing Request (CSR) as described in RFC 2986
+///
+/// Pass one of these to [`Order::finalize_with()`][crate::Order::finalize_with()] to request
+/// a certificate for a key pair that instant-acme never gets to see. This is the API to use
+/// if your private key lives in an HSM, a KMS, or a file that should not be read into the
+/// process: generate the CSR wherever the key lives, then hand the result over.
+///
+/// The CSR must carry a subjectAltName extension covering every identifier in the order
+/// (see RFC 8555 section 7.4), and its key must not be the account key (section 11.1).
+///
+/// ```no_run
+/// # use instant_acme::{Csr, Error};
+/// # fn main() -> Result<(), Error> {
+/// let csr = Csr::from_pem(b"-----BEGIN CERTIFICATE REQUEST-----\n...")?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct Csr<'a>(CertificateSigningRequestDer<'a>);
+
+impl<'a> Csr<'a> {
+    /// Use a CSR that is already in DER encoding
+    pub fn from_der(der: impl Into<CertificateSigningRequestDer<'a>>) -> Self {
+        Self(der.into())
+    }
+
+    /// Decode a PEM-encoded CSR (a `CERTIFICATE REQUEST` section)
+    ///
+    /// Only the first `CERTIFICATE REQUEST` section is used; other sections are ignored.
+    pub fn from_pem(pem: &[u8]) -> Result<Csr<'static>, Error> {
+        Ok(Csr(CertificateSigningRequestDer::from_pem_slice(pem)?))
+    }
+
+    /// Read a PEM-encoded CSR from the file at `path`
+    ///
+    /// See [`Csr::from_pem()`] for the details of the decoding.
+    #[cfg(feature = "fs")]
+    #[cfg_attr(instant_acme_docsrs, doc(cfg(feature = "fs")))]
+    pub fn from_pem_file(path: impl AsRef<std::path::Path>) -> Result<Csr<'static>, Error> {
+        Ok(Csr(CertificateSigningRequestDer::from_pem_file(path)?))
+    }
+
+    /// The DER encoding of the CSR
+    pub fn der(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<'a> From<&'a [u8]> for Csr<'a> {
+    fn from(der: &'a [u8]) -> Self {
+        Self(der.into())
+    }
+}
+
+impl From<Vec<u8>> for Csr<'_> {
+    fn from(der: Vec<u8>) -> Self {
+        Self(der.into())
+    }
+}
+
+impl<'a> From<CertificateSigningRequestDer<'a>> for Csr<'a> {
+    fn from(der: CertificateSigningRequestDer<'a>) -> Self {
+        Self(der)
+    }
+}
+
+/// Borrow a CSR from something that owns its DER encoding
+///
+/// This exists because `Into<CertificateSigningRequestDer<'_>>` is not implemented for
+/// references to it, so `Csr::from_der(csr.der())` would not compile for, say, an
+/// `rcgen::CertificateSigningRequest`.
+impl<'a> From<&'a CertificateSigningRequestDer<'a>> for Csr<'a> {
+    fn from(der: &'a CertificateSigningRequestDer<'a>) -> Self {
+        Self(der.as_ref().into())
+    }
+}
+
+impl AsRef<[u8]> for Csr<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.der()
     }
 }
 
@@ -1069,13 +1166,55 @@ pub(crate) struct Empty {}
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "x509-parser", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[cfg(all(
+        feature = "rcgen",
+        feature = "x509-parser",
+        any(feature = "aws-lc-rs", feature = "ring")
+    ))]
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, IsCa, Issuer, KeyIdMethod, KeyPair,
         SerialNumber,
     };
 
     use super::*;
+
+    const CSR_PEM: &[u8] = include_bytes!("../tests/testdata/csr.pem");
+    const CSR_DER: &[u8] = include_bytes!("../tests/testdata/csr.der");
+
+    #[test]
+    fn csr_from_pem() {
+        assert_eq!(Csr::from_pem(CSR_PEM).unwrap().der(), CSR_DER);
+    }
+
+    #[test]
+    fn csr_from_der() {
+        assert_eq!(Csr::from_der(CSR_DER).der(), CSR_DER);
+        assert_eq!(Csr::from(CSR_DER).der(), CSR_DER);
+        assert_eq!(Csr::from(CSR_DER.to_vec()).der(), CSR_DER);
+
+        let der = CertificateSigningRequestDer::from(CSR_DER);
+        assert_eq!(Csr::from(&der).der(), CSR_DER);
+        assert_eq!(Csr::from_der(der).der(), CSR_DER);
+    }
+
+    #[test]
+    fn csr_from_invalid_pem() {
+        // Not PEM at all
+        assert!(matches!(Csr::from_pem(CSR_DER), Err(Error::Pem(_))));
+        // A PEM section, but not a CSR
+        let cert = include_bytes!("../tests/testdata/server.pem");
+        assert!(matches!(Csr::from_pem(cert), Err(Error::Pem(_))));
+        // Truncated: no end marker
+        let truncated = &CSR_PEM[..CSR_PEM.len() / 2];
+        assert!(matches!(Csr::from_pem(truncated), Err(Error::Pem(_))));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn csr_from_pem_file() {
+        let csr = Csr::from_pem_file("tests/testdata/csr.pem").unwrap();
+        assert_eq!(csr.der(), CSR_DER);
+    }
 
     // https://datatracker.ietf.org/doc/html/rfc8555#section-7.4
     #[test]
@@ -1287,7 +1426,11 @@ mod tests {
         assert_eq!(serialized, r#""aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE""#);
     }
 
-    #[cfg(all(feature = "x509-parser", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[cfg(all(
+        feature = "rcgen",
+        feature = "x509-parser",
+        any(feature = "aws-lc-rs", feature = "ring")
+    ))]
     #[test]
     fn encoded_certificate_identifier_from_cert() {
         // Generate a CA key_pair and self-signed cert with a specific subject key identifier.

@@ -59,7 +59,7 @@ pub use order::{
 mod types;
 pub use types::{
     AccountCredentials, Authorization, AuthorizationState, AuthorizationStatus,
-    AuthorizedIdentifier, CertificateIdentifier, Challenge, ChallengeStatus, ChallengeType,
+    AuthorizedIdentifier, CertificateIdentifier, Challenge, ChallengeStatus, ChallengeType, Csr,
     DeviceAttestation, EcCurve, Error, Identifier, Jwk, JwkThumbFields, LetsEncrypt, NewAccount,
     NewOrder, OctetKeyCurve, OrderState, OrderStatus, Problem, ProfileMeta, RevocationReason,
     RevocationRequest, SigningAlgorithm, Subproblem, ZeroSsl,
