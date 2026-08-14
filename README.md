@@ -56,4 +56,12 @@ If both `ring` and `aws-lc-rs` are enabled, `aws-lc-rs` will be used.
 
 ## Getting started
 
-See the [examples](examples) directory for an example of how to use instant-acme.
+See the [examples](examples) directory for examples of how to use instant-acme:
+
+* [`provision.rs`](examples/provision.rs): issue a certificate, letting instant-acme generate
+  the key pair and CSR for you
+* [`provision_csr.rs`](examples/provision_csr.rs): issue a certificate for a CSR you generated
+  elsewhere, so the private key never reaches this process (run it with `--features
+  x509-parser` to check the CSR against the order first)
+* [`csr_external_key.rs`](examples/csr_external_key.rs): build that CSR against a key held by
+  an external signer, like an HSM or a KMS

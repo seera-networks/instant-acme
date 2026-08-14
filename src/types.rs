@@ -272,6 +272,16 @@ impl fmt::Display for Subproblem {
 ///
 /// The CSR must carry a subjectAltName extension covering every identifier in the order
 /// (see RFC 8555 section 7.4), and its key must not be the account key (section 11.1).
+/// With openssl, and a key the process never reads:
+///
+/// ```sh
+/// openssl req -new -key server.key -subj "/" \
+///     -addext "subjectAltName=DNS:example.com,DNS:www.example.com" -out server.csr
+/// ```
+///
+/// The empty subject is deliberate: a common name that is not also a subjectAltName gets the
+/// CSR rejected. See `examples/csr_external_key.rs` for building one against a key that lives
+/// in an HSM or KMS, and `examples/provision_csr.rs` for the issuance flow around it.
 ///
 /// ```no_run
 /// # use instant_acme::{Csr, Error};
@@ -380,7 +390,8 @@ impl<'a> Csr<'a> {
             }
         }
 
-        if !has_san && !(wanted_dns.is_empty() && wanted_ips.is_empty()) {
+        let wants_names = !wanted_dns.is_empty() || !wanted_ips.is_empty();
+        if wants_names && !has_san {
             return Err(CsrError::NoSubjectAltName);
         }
 

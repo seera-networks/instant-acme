@@ -11,6 +11,7 @@
   3. 外部鍵（HSM / KMS / 既存の鍵ファイル）から CSR を作る導線がドキュメント・サンプルの両方に存在しない。README も `finalize()` 中心。
   4. `finalize_csr` は「CSR を渡す」以上の型情報を持たないため、誤って証明書 DER や PEM バイト列を渡してもコンパイルは通る。
 - **方針**: 新しいプロトコル層を作るのではなく、(A) CSR 入力の型付けと PEM 対応、(B) 任意有効化の事前検証、(C) 外部署名鍵ワークフローの例とドキュメント、の 3 段階で積み上げる。ASN.1 エンコーダを instant-acme に持ち込むことは避ける。
+- **進捗**: フェーズ 1（#2）・フェーズ 2（#3）・フェーズ 3（#4）すべて実装済み。本書は各 PR の決定を反映して更新している。
 
 ---
 
@@ -301,10 +302,11 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
 
 ### PR 3: サンプルとドキュメント（フェーズ 3）
 
-- [ ] `examples/provision_csr.rs`
-- [ ] `README.md` の Features に「外部生成 CSR / 外部保管鍵での発行」を追記、Cargo features 節を更新
-- [ ] `Order::finalize_csr` / `finalize_with` の rustdoc に、鍵を渡さない運用の説明と OpenSSL コマンド例を追加
-- [ ] `tests/pebble.rs` に外部 CSR 経路の統合テスト（`#[ignore]` 付き、既存テストと同じ運用）
+- [x] `examples/provision_csr.rs`（`--csr <path>` で鍵に触れずに発行。pebble に向けられるよう `--directory` / `--ca-cert` も追加）
+- [x] `examples/csr_external_key.rs`（`rcgen::SigningKey` を外部署名器として実装。SPKI ではなく EC point を返すこと、署名は DER、同期 `sign` と非同期 KMS の橋渡しをコメントで明示）
+- [x] `README.md` の Features / Cargo features / Getting started を更新（PR #2・#3 で一部先行）
+- [x] `Csr` の rustdoc に鍵を渡さない運用の説明と openssl コマンド例を追加
+- [x] `tests/pebble.rs` に外部 CSR 経路の統合テスト（PR #2 で先行、PR #3 で検証も追加）
 
 上流（djc/instant-acme）への提出はこの 3 分割が妥当。PR 1 だけでも単体で価値があり、レビューしやすい。PR 2 は「検証を暗黙にするか明示にするか」で議論になりうるので、Issue で方針合意を取ってから出す。
 
