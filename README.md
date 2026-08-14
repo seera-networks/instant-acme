@@ -17,6 +17,8 @@ specification.
 * Supported extensions:
   * [ACME renewal information (ARI)]
   * [Profiles]
+* Issue from an externally generated PKCS#10 CSR, keeping the certificate's private key
+  out of the process (HSM, KMS, or a key file you never read)
 * Support for external account binding, key rollover, and contact updates
 * Support for certificate revocation
 * Store/recover your account credentials by serializing/deserializing
@@ -35,6 +37,10 @@ specification.
 * `aws-lc-rs` (default): use the aws-lc-rs crate as the crypto backend
 * `ring`: use the *ring* crate as the crypto backend
 * `fips`: enable the aws-lc-rs crate's FIPS-compliant mode
+* `fs`: enable APIs that read from the filesystem, like `Csr::from_pem_file()`
+  (implied by `hyper-rustls`)
+* `rcgen`: enable `Order::finalize()`, which generates a key pair and a CSR for you.
+  Without it, generate the CSR yourself and use `Order::finalize_with()`
 * `x509-parser`: enable extracting `CertificateIdentifier` values for ARI from
   certificates
 * `time`: enable fetching `RenewalInfo` for a `CertificateIdentifier`

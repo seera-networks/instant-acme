@@ -25,12 +25,13 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use instant_acme::{
-    Account, AuthorizationStatus, BodyWrapper, ChallengeHandle, ChallengeType, CryptoProvider,
+    Account, AuthorizationStatus, BodyWrapper, ChallengeHandle, ChallengeType, CryptoProvider, Csr,
     Error, ExternalAccountKey, Identifier, Key, KeyAuthorization, NewAccount, NewOrder, Order,
     OrderStatus, RetryPolicy,
 };
 #[cfg(all(feature = "time", feature = "x509-parser"))]
 use instant_acme::{CertificateIdentifier, RevocationRequest};
+use rcgen::{CertificateParams, DistinguishedName, KeyPair, PublicKeyData};
 use rustls::RootCertStore;
 use rustls::client::{verify_server_cert_signed_by_trust_anchor, verify_server_name};
 use rustls::pki_types::pem::PemObject;
@@ -89,6 +90,47 @@ async fn tls_alpn_01() -> Result<(), Box<dyn StdError>> {
         .test::<Alpn01>(&NewOrder::new(&dns_identifiers(["tlsalpn01.example.com"])))
         .await
         .map(|_| ())
+}
+
+/// Test issuance for a CSR that was generated outside of instant-acme
+///
+/// The private key is never handed to the library: only the finished CSR is.
+#[tokio::test]
+#[ignore]
+async fn external_csr() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    let names = ["csr.example.com", "www.csr.example.com"];
+    let mut env = Environment::new(EnvironmentConfig::default()).await?;
+    let mut order = env
+        .account
+        .new_order(&NewOrder::new(&dns_identifiers(names)))
+        .await?;
+    env.solve::<Http01>(&mut order).await?;
+
+    // Generate the key pair and the CSR the way an external tool would.
+    let key_pair = KeyPair::generate()?;
+    let mut params = CertificateParams::new(names.map(str::to_owned).to_vec())?;
+    params.distinguished_name = DistinguishedName::new();
+    let csr = params.serialize_request(&key_pair)?;
+
+    // Hand over the CSR as PEM, exercising `Csr::from_pem()` as well as `finalize_with()`.
+    order
+        .finalize_with(&Csr::from_pem(csr.pem()?.as_bytes())?)
+        .await?;
+
+    let chain = order.poll_certificate(&RETRY_POLICY).await?;
+    let ee_cert = CertificateDer::from_pem_slice(chain.as_bytes())?;
+
+    // The issued certificate must carry the public key from our CSR, not one instant-acme
+    // picked: look for the SubjectPublicKeyInfo we asked for in the certificate's DER.
+    let spki = key_pair.subject_public_key_info();
+    assert!(
+        ee_cert.windows(spki.len()).any(|window| window == spki),
+        "issued certificate does not contain the CSR's public key"
+    );
+
+    Ok(())
 }
 
 /// Test subproblem handling by trying to issue for a forbidden identifier
@@ -637,32 +679,7 @@ impl Environment {
         let mut order = self.account.new_order(new_order).await?;
         info!(order_url = order.url(), "created order");
 
-        // Collect up the relevant challenges, provisioning the expected responses as we go.
-        let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
-            let mut authz = result?;
-            match authz.status {
-                AuthorizationStatus::Pending => {}
-                AuthorizationStatus::Valid => continue,
-                _ => unreachable!("unexpected authz state: {:?}", authz.status),
-            }
-
-            let mut challenge = authz
-                .challenge(A::TYPE)
-                .ok_or_else(|| format!("no {:?} challenge found", A::TYPE))?;
-
-            let key_authz = challenge.key_authorization()?;
-            self.request_challenge::<A>(&challenge, &key_authz).await?;
-
-            debug!(challenge_url = challenge.url, "marking challenge ready");
-            challenge.set_ready().await?;
-        }
-
-        // Poll until the order is ready.
-        let status = order.poll_ready(&RETRY_POLICY).await?;
-        if status != OrderStatus::Ready {
-            return Err(format!("unexpected order status: {status:?}").into());
-        }
+        self.solve::<A>(&mut order).await?;
 
         // Issue a certificate for the names, returning the certificate chain.
         let cert_chain = self.certificate(&mut order).await?;
@@ -704,6 +721,41 @@ impl Environment {
         }
 
         Ok(ee_cert_der.to_owned())
+    }
+
+    /// Complete each pending authorization of `order`, then wait for it to become ready
+    async fn solve<A: AuthorizationMethod>(
+        &mut self,
+        order: &mut Order,
+    ) -> Result<(), Box<dyn StdError + 'static>> {
+        // Collect up the relevant challenges, provisioning the expected responses as we go.
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
+            match authz.status {
+                AuthorizationStatus::Pending => {}
+                AuthorizationStatus::Valid => continue,
+                _ => unreachable!("unexpected authz state: {:?}", authz.status),
+            }
+
+            let mut challenge = authz
+                .challenge(A::TYPE)
+                .ok_or_else(|| format!("no {:?} challenge found", A::TYPE))?;
+
+            let key_authz = challenge.key_authorization()?;
+            self.request_challenge::<A>(&challenge, &key_authz).await?;
+
+            debug!(challenge_url = challenge.url, "marking challenge ready");
+            challenge.set_ready().await?;
+        }
+
+        // Poll until the order is ready.
+        let status = order.poll_ready(&RETRY_POLICY).await?;
+        if status != OrderStatus::Ready {
+            return Err(format!("unexpected order status: {status:?}").into());
+        }
+
+        Ok(())
     }
 
     /// Issue a certificate for the given order, and identifiers
