@@ -55,7 +55,9 @@ let chain_pem = order.poll_certificate(&RetryPolicy::default()).await?;
 ### 1.3 既に手元にある道具（新規依存が不要な根拠）
 
 - `rustls-pki-types`（**必須依存**、現在 `"1.1.0"` 指定）に `CertificateSigningRequestDer<'a>` と `pem::PemObject` があり、`from_pem_slice` / `from_pem_file` が使える（1.15.0 および 1.12.0 のソースで確認済み。正確な導入バージョンは crates.io で要確認、最低 1.12 への引き上げを想定）。PEM 対応は**新規クレートの追加なし**で実現できる。
-  - ただし `from_pem_file` は `#[cfg(feature = "std")]`（`rustls-pki-types` の `src/pem.rs:36`）。instant-acme の依存宣言は features 指定なしで、`rustls-pki-types` の default は `["alloc"]` のみ。現状 `std` は `rustls` / `hyper-rustls` 経由でしか有効にならず、`--no-default-features --features aws-lc-rs`（HTTP クライアント持ち込み構成）では `from_pem_file` がコンパイルできない。**依存宣言に `features = ["std"]` を明示する**こと。他クレートの feature 有効化に依存する状態は、本書 §3 フェーズ 2 で自ら警告している feature unification 依存そのものになる。
+  - `pub mod pem` 自体は `alloc`（`rustls-pki-types` の default）で有効。**バイト列からの `from_pem_slice` は追加 feature なしで使える**（`src/pem.rs:21`）。
+  - 一方 `from_pem_file` / `pem_file_iter` / `from_pem_reader` は `#[cfg(feature = "std")]`（`src/pem.rs:36-60`）。instant-acme は `rustls-pki-types` を features 指定なしで宣言しており、`std` は現状 `rustls` / `hyper-rustls` 経由でしか有効にならない。`--no-default-features --features aws-lc-rs`（HTTP クライアント持ち込み構成）ではファイル系 API がコンパイルできない。→ 対応は §3 フェーズ 1 の `fs` feature を参照。
+  - なお `src/lib.rs:239` の `CertificateDer::from_pem_file()`（`hyper-rustls` feature 配下）も、この暗黙に有効化された `std` に乗っている。既存の潜在的な脆さでもあるので、同じ `fs` feature で明示化したい。
 - `Cargo.toml` の `package.metadata.cargo_check_external_types.allowed_external_types` に `rustls_pki_types::*` が既に入っている。公開 API に出しても外部型チェックを通る。
 - `x509-parser`（既存の optional 依存、`x509-parser` feature）に `X509CertificationRequest` があり、**追加 feature なし**で CSR のパースと `requested_extensions()` が使える。署名検証 `verify_signature()` だけ `verify`（ring）/ `verify-aws`（aws-lc-rs）feature が必要で、これは instant-acme の既存バックエンド feature に素直に対応付けられる。
 - `rcgen` 0.14（既存の optional 依存）は公開トレイト `SigningKey: PublicKeyData` を持ち、`CertificateParams::serialize_request(&impl SigningKey)` に**外部実装の署名器**を渡せる。KMS/HSM 署名の CSR 生成は instant-acme 本体を変更せずに書ける。
@@ -96,10 +98,11 @@ impl<'a> Csr<'a> {
     /// DER エンコードされた CSR から構築する
     pub fn from_der(der: impl Into<CertificateSigningRequestDer<'a>>) -> Self;
 
-    /// PEM (`CERTIFICATE REQUEST`) から構築する
+    /// PEM (`CERTIFICATE REQUEST`) から構築する（feature 不要）
     pub fn from_pem(pem: &[u8]) -> Result<Csr<'static>, Error>;
 
-    /// PEM ファイルから読み込む（`rustls-pki-types` の `std` feature が必要）
+    /// PEM ファイルから読み込む
+    #[cfg(feature = "fs")]
     pub fn from_pem_file(path: impl AsRef<Path>) -> Result<Csr<'static>, Error>;
 
     /// DER バイト列を借用する
@@ -110,7 +113,33 @@ impl<'a> From<&'a [u8]> for Csr<'a> { /* ... */ }
 impl<'a> From<&'a CertificateSigningRequestDer<'a>> for Csr<'a> { /* ... */ }
 ```
 
-`from_pem` / `from_pem_file` は `rustls_pki_types::pem::PemObject` に委譲する（`from_pem_file` は `std` feature 前提。instant-acme は既に `hyper-rustls` 経路で `PemObject` を使用中）。
+`from_pem` / `from_pem_file` は `rustls_pki_types::pem::PemObject` に委譲する。
+
+#### ファイル読み込みの feature ゲート: `fs`
+
+`rustls-pki-types` の依存宣言に `features = ["std"]` を無条件に足す案は採らない。`no_std` 構成を将来的に閉ざすうえ、PEM をバイト列で渡すだけの利用者にまでファイル I/O を強制することになるため。代わりに instant-acme 側に専用 feature を切る。
+
+```toml
+[features]
+# ファイルパスを受け取る API を有効にする
+fs = ["rustls-pki-types/std"]
+
+# 既存の `DefaultClient::builder_with_root_cert_file()` (src/lib.rs:236-239) は
+# 既にファイル I/O を行っており、rustls 経由で暗黙に有効化された std に乗っている。
+# その依存関係を明示に変える。
+hyper-rustls = ["dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:rustls", "fs"]
+```
+
+| 判断 | 理由 |
+| --- | --- |
+| 依存宣言への `features = ["std"]` 直書きは不採用 | 利用者が選べない。`no_std` 化の余地を潰す |
+| `hyper-rustls` feature でゲートするのも不採用 | HTTP クライアントの選択と PEM ファイル読み込みは無関係。`hyper-rustls` を切った途端にファイル API が消えるのは非直感的で、本書 §3 フェーズ 2 が警告する「他 feature への暗黙の相乗り」そのもの |
+| 新 feature 名は `fs` | 「ファイルシステムに触る API」を素直に表す。将来ファイル系ヘルパが増えても同じゲートに収まる |
+| `std` という名前は使わない | instant-acme は tokio 等により元々 std 必須。クレート全体の std 化を意味すると誤読される |
+
+`fs` 無効時でも `Csr::from_pem(&bytes)` は使えるため、機能上の欠落は「パスを渡す糖衣」のみ。呼び出し側は `Csr::from_pem(&std::fs::read(path)?)` で等価なことができる。
+
+feature 名の候補としては `fs` のほか `pem-file` / `file` も検討したが、`fs` を推す。上流に出す際は名前について合意を取る（§8 参照）。
 
 API 変更の選択肢:
 
@@ -231,7 +260,7 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
 | `src/types.rs` | `Csr<'a>` 型の定義、`CsrError`、`Error` への variant 追加 | 1, 2 |
 | `src/order.rs` | `finalize_with()` と `Order::validate_csr()` の追加、`finalize_csr()` を薄いラッパ化、doc コメントに CSR 経路の説明追加 | 1, 2 |
 | `src/lib.rs` | `pub use types::{Csr, CsrError}` の追加 | 1 |
-| `Cargo.toml` | `rustls-pki-types` の最低バージョン引き上げと `features = ["std"]` の明示、`rcgen/...` → `rcgen?/...` の修正、`aws-lc-rs`/`ring` feature から `x509-parser?/verify-aws`・`x509-parser?/verify` への伝播、新 example の登録 | 1, 2 |
+| `Cargo.toml` | `rustls-pki-types` の最低バージョン引き上げ、`fs` feature の追加と `hyper-rustls` への追加、`rcgen/...` → `rcgen?/...` の修正、`aws-lc-rs`/`ring` feature から `x509-parser?/verify-aws`・`x509-parser?/verify` への伝播、新 example の登録 | 1, 2 |
 | `examples/provision_csr.rs`（新規） | `--csr <path>` を受け取り、鍵に一切触らず発行するサンプル | 3 |
 | `examples/csr_external_key.rs`（新規・任意） | rcgen の `SigningKey` を外部実装するサンプル（ダミー署名器で可） | 3 |
 | `tests/pebble.rs` | 外部 CSR 経路の統合テストを追加 | 1, 2 |
@@ -247,12 +276,14 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
 
 - [ ] `Csr<'a>` を実装（`from_der` / `from_pem` / `from_pem_file` / `der`）
 - [ ] `Order::finalize_with(&mut self, csr: &Csr<'_>)` を追加、`finalize_csr` をラッパ化
-- [ ] `Cargo.toml` の `rustls-pki-types` を `CertificateSigningRequestDer` が入るバージョン以上に引き上げ、**`features = ["std"]` を明示**（`from_pem_file` のため。他クレート経由の `std` 有効化に依存しない）
+- [ ] `Cargo.toml` の `rustls-pki-types` を `CertificateSigningRequestDer` が入るバージョン以上に引き上げ
+- [ ] `fs = ["rustls-pki-types/std"]` を追加し、`Csr::from_pem_file` をゲート。`hyper-rustls` feature に `fs` を追加して `src/lib.rs:239` の暗黙の `std` 依存を明示化
 - [ ] `Cargo.toml` の `aws-lc-rs` / `ring` feature を `rcgen/...` から **`rcgen?/...`** に修正（optional な `rcgen` を巻き込まないようにする）
 - [ ] `cargo check-external-types` が通ることを確認（`rustls_pki_types::*` は許可済み）
 - [ ] PEM 入力の unit テスト（固定フィクスチャの PEM をデコードした結果が、対応する DER フィクスチャと一致すること）
 - [ ] feature 組み合わせのビルド確認
-  - `--no-default-features --features aws-lc-rs`（HTTP クライアント持ち込み。`std` 明示が効いているかの確認を兼ねる）
+  - `--no-default-features --features aws-lc-rs`（`fs` なし。`from_pem` は使え、`from_pem_file` は生えないこと）
+  - `--no-default-features --features aws-lc-rs,fs`（HTTP クライアント持ち込みでもファイル API が使えること）
   - `--no-default-features --features hyper-rustls,aws-lc-rs`（`cargo tree -e features | grep rcgen` が空になること。修正前は `rcgen v0.14.7` が入る）
 
 ### PR 2: 検証（フェーズ 2）
@@ -304,12 +335,13 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
 
 - **semver**: 案 C を採る限りすべて純粋な追加。`Error` は既に `#[non_exhaustive]`（`src/types.rs:23-26`）なので `Error::Csr` の追加も非破壊。ただし `rcgen/...` → `rcgen?/...` の修正は、これまで暗黙に `rcgen` が有効化されていたことに依存していた下流をビルドエラーにしうる（`Order::finalize()` が消える）。0.10.0 に含めるか、CHANGELOG で明示する。
 - **MSRV**: 現在 1.85。新しい言語機能は不要なので据え置き。
-- **依存**: 新規クレートの追加なし。`rustls-pki-types` の最低バージョン引き上げと `std` feature の明示のみ。`std` は既定構成では他クレート経由で有効になっているため、実質的な増分は無い。
+- **依存**: 新規クレートの追加なし。`rustls-pki-types` の最低バージョン引き上げと、新 feature `fs` からの `rustls-pki-types/std` 有効化のみ。既定構成では `std` は `rustls` 経由で既に有効なため実質的な増分は無い。`fs` は既定では無効（`hyper-rustls` を使う既定構成では連動して有効）。
 - **feature 表**（更新後の想定）
 
   | feature | CSR 経路への影響 |
   | --- | --- |
-  | （なし） | `Csr::from_der` / `from_pem` / `finalize_with` が使える。**`rcgen?/...` への修正後は**鍵生成コードがリンクされない |
+  | （なし） | `Csr::from_der` / `from_pem`（バイト列）/ `finalize_with` が使える。**`rcgen?/...` への修正後は**鍵生成コードがリンクされない |
+  | `fs` | `Csr::from_pem_file()` が使える（`rustls-pki-types/std` を有効化） |
   | `x509-parser` | `Order::validate_csr()` / `Csr::validate()` が使える |
   | `x509-parser` + `aws-lc-rs` / `ring` | 上記に加えて CSR 署名検証が有効 |
   | `rcgen` + バックエンド | 従来どおり `Order::finalize()` による鍵自動生成も使える |
@@ -324,7 +356,8 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:object=tls-key" -su
 4. **`x509-parser` の `verify` feature が `ring` を引き込む** — instant-acme が `aws-lc-rs` のみ構成のとき、誤って `verify`（ring 版）を有効にすると ring が余計にリンクされる。feature マッピングを間違えないこと。テストで `cargo tree` を確認する。なお両方有効でも `verify-aws` が優先されるためビルドは壊れない。
 5. **rcgen の同期 `sign` と非同期 KMS** — 本体の課題ではないがユーザが必ず踏む。サンプルに `spawn_blocking` パターンを含める。ここを避けたい場合は「CSR は別プロセス/別ツールで作る」ことを推奨経路として提示する。
 6. **`Order::finalize()` の非推奨化** — 鍵を返す API はメモリ上に秘密鍵を載せるため、CSR 経路が整った後は「テスト・デモ向け」と位置づけを明記したい。ただし既存利用者が多いはずなので削除はしない。ドキュメントでの誘導に留める。
-7. **`rcgen?/...` への変更の是非** — 「`aws-lc-rs` を有効にすると `rcgen` も有効になる」現状の挙動は、`Order::finalize()` を常に使えるようにする意図的な設計かもしれない。上流に出す前に Issue で意図を確認する。少なくとも当リポジトリ（seera-networks fork）では鍵生成コードを含めない構成を取れるようにしたい。
+7. **`fs` という feature 名** — `pem-file` / `file` / `paths` なども候補。`fs` は「ファイルシステムに触る API 群」を表す語として一般的で、将来ファイル系ヘルパが増えても収まる点を評価して推している。`std` は instant-acme が元々 std 必須である以上、誤解を招くので避ける。上流に出す前に名前を合意する。また `hyper-rustls` に `fs` を含める変更は、`hyper-rustls` 単体を有効にしていた利用者にとって feature が 1 つ増えるだけで API は変わらないため非破壊。
+8. **`rcgen?/...` への変更の是非** — 「`aws-lc-rs` を有効にすると `rcgen` も有効になる」現状の挙動は、`Order::finalize()` を常に使えるようにする意図的な設計かもしれない。上流に出す前に Issue で意図を確認する。少なくとも当リポジトリ（seera-networks fork）では鍵生成コードを含めない構成を取れるようにしたい。
 
 ---
 
